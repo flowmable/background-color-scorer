@@ -20,7 +20,35 @@ public record BackgroundEvaluationResult(
         double legibilityContrast, // Added field
         double legibilityPenalty,
         double visualAppealScore,
+        double inkPenalty,     // New: Explicit Ink Bias (Positive value = penalty)
+        double marketBonus,    // New: Explicit Market Weight (Positive or Negative)
         double finalScore,
         Suitability suitability,
         String overrideReason
-) {}
+) {
+    // Secondary constructor for convenience, initializing some fields to default values
+    public BackgroundEvaluationResult(String hexColor, double contrastScore, double collisionScore, double printRiskScore,
+                                      double baseScore, double legibilityContrast, double legibilityPenalty,
+                                      double visualAppealScore, double finalScore, Suitability suitability, String overrideReason) {
+        this(hexColor, contrastScore, collisionScore, printRiskScore, baseScore, legibilityContrast, legibilityPenalty,
+                visualAppealScore, 0.0, 0.0, finalScore, suitability, overrideReason);
+    }
+
+    // Another secondary constructor, assuming more defaults
+    public BackgroundEvaluationResult(String hexColor, double score, Suitability suitability, String note) {
+        this(hexColor,
+                0.0, // contrastScore
+                0.0, // collisionScore
+                0.0, // printRiskScore
+                0.0, // baseScore
+                0.0, // legibilityContrast
+                0.0, // legibilityPenalty
+                0.0, // visualAppealScore
+                0.0, // inkPenalty
+                0.0, // marketBonus
+                score,
+                suitability,
+                note
+        );
+    }
+}

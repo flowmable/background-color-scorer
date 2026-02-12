@@ -1,23 +1,19 @@
 package com.flowmable.scorer;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Phase 2: Per-background-color evaluation.
  * <p>
- * Computes contrast, collision, and print risk scores, then combines
- * them into a weighted final score with classification and safety overrides.
+ * V3 SCORING MODEL (Bounded Energy Layering)
+ * <p>
+ * Layer 1: Perceptual Energy (Physics) - Deterministic, Determinant of StdDev.
+ * Layer 2: Aesthetic Energy (Coherence) - Bounded, Normalized to Physics.
+ * Layer 3: Commercial Energy (Bias) - Scaled, Orthogonal.
+ * Layer 4: Variance Governance - Distribution-aware budgeting.
  */
 public class BackgroundEvaluator {
-
-    private static final double CONTRAST_WEIGHT = 0.40;
-    private static final double COLLISION_WEIGHT = 0.35;
-    private static final double PRINT_RISK_WEIGHT = 0.25;
-
-    /** Minimum weight for a dominant color to participate in scoring (2% floor). */
-    private static final double MIN_COVERAGE_WEIGHT = 0.02;
-
-
 
     private final ScoringThresholds thresholds;
 
@@ -30,287 +26,366 @@ public class BackgroundEvaluator {
     }
 
     /**
-     * Evaluate a single background color against a design analysis result.
+     * Data Contract: PURE PHYSICS.
+     * Contains only deterministic physical measurements.
      */
-    public BackgroundEvaluationResult evaluate(DesignAnalysisResult design, String hexColor) {
+    public record RawScoringData(
+            double rawContrastScore, // Weighted sum of P10, Mean, Min (with fragility)
+            double p10DeltaE,
+            double minClusterDeltaE,
+            double weightedMeanDeltaE,
+            double fragility,
+            double tonalPenalty,
+            double vibrationPenalty,
+            double[] bgLab // Cached for Phase 2
+    ) {
+        public double netRawScore() {
+            return rawContrastScore + tonalPenalty + vibrationPenalty;
+        }
+    }
+
+    // --- PHASE 1: RAW EVALUATION (PURE) ---
+
+    public RawScoringData evaluateRaw(DesignAnalysisResult design, String hexColor) {
         int bgRgb = Integer.parseInt(hexColor.replaceFirst("#", ""), 16);
         int bgR = (bgRgb >> 16) & 0xFF;
         int bgG = (bgRgb >> 8) & 0xFF;
         int bgB = bgRgb & 0xFF;
-        double[] bgLab = ColorSpaceUtils.srgbToLab(bgR, bgG, bgB);
-        double bgLuminance = ColorSpaceUtils.relativeLuminance(bgR, bgG, bgB);
+        double[] bgLabD = ColorSpaceUtils.srgbToLab(bgR, bgG, bgB);
+        float[] bgLabF = new float[]{(float) bgLabD[0], (float) bgLabD[1], (float) bgLabD[2]};
 
-        // Filter scoring colors by 2% coverage floor
-        List<DominantColor> scoringColors = design.dominantColors().stream()
-                .filter(dc -> dc.weight() >= MIN_COVERAGE_WEIGHT)
-                .toList();
-
-        // Safety override S3: degenerate design
-        if (scoringColors.isEmpty()) {
-            return new BackgroundEvaluationResult(
-                    hexColor, 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0,
-                    Suitability.BAD,
-                    "DEGENERATE: no significant foreground content"
-            );
+        // 0. Degenerate Input Check (Handled in Scorer or returning 0)
+        if (design.foregroundPixelCount() == 0) {
+            return new RawScoringData(0, 0, 0, 0, 0, 0, 0, bgLabD);
         }
 
-        // Re-normalize weights
-        double totalWeight = scoringColors.stream().mapToDouble(DominantColor::weight).sum();
-
-        // --- Contrast Score (GAP 1: Explicit Formula) ---
-        double[] deltaEs = new double[scoringColors.size()];
-        double[] normWeights = new double[scoringColors.size()];
-        for (int i = 0; i < scoringColors.size(); i++) {
-            DominantColor dc = scoringColors.get(i);
-            deltaEs[i] = ColorSpaceUtils.ciede2000(
-                    dc.labL(), dc.labA(), dc.labB(),
-                    bgLab[0], bgLab[1], bgLab[2]
-            );
-            normWeights[i] = dc.weight() / totalWeight;
-        }
-
-        // Step 3: Weighted mean ΔE
+        // 1. Cluster Deltas (Min & Mean)
+        List<DominantColor> colors = design.dominantColors();
+        double minClusterDeltaE = Double.MAX_VALUE;
         double weightedMeanDeltaE = 0;
-        for (int i = 0; i < scoringColors.size(); i++) {
-            weightedMeanDeltaE += normWeights[i] * deltaEs[i];
+        double totalWeight = 0;
+
+        for (DominantColor dc : colors) {
+            double de = ColorSpaceUtils.ciede2000(dc.labL(), dc.labA(), dc.labB(), bgLabD[0], bgLabD[1], bgLabD[2]);
+            if (de < minClusterDeltaE) minClusterDeltaE = de;
+            weightedMeanDeltaE += de * dc.weight();
+            totalWeight += dc.weight();
         }
+        if (totalWeight > 0) weightedMeanDeltaE /= totalWeight;
+        if (minClusterDeltaE == Double.MAX_VALUE) minClusterDeltaE = 0;
 
-        // Step 4: Worst-case (minimum) ΔE for significant colors
-        double minDeltaE = Double.MAX_VALUE;
-        for (int i = 0; i < scoringColors.size(); i++) {
-            if (normWeights[i] >= 0.05) {
-                minDeltaE = Math.min(minDeltaE, deltaEs[i]);
-            }
-        }
-        if (minDeltaE == Double.MAX_VALUE) {
-            // All colors are small; use overall min
-            for (double de : deltaEs) {
-                minDeltaE = Math.min(minDeltaE, de);
-            }
-        }
+        // 2. P10 Pixel Contrast
+        double p10DeltaE = calculateP10DeltaE(design, bgLabF, minClusterDeltaE);
 
-        // Step 5: Composite raw contrast
-        double rawContrast = 0.7 * weightedMeanDeltaE + 0.3 * minDeltaE;
-
-        // Step 6: Normalize to 0–100
-        double normalizedContrast = clamp(rawContrast * 2.0, 0, 100);
-
-        // Step 7: Edge density penalty
-        double edgePenalty = 0;
-        if (normalizedContrast < 50) {
-            edgePenalty = (50 - normalizedContrast) * design.edgeDensity() * 0.3;
-        }
-        double contrastScore = clamp(normalizedContrast - edgePenalty, 0, 100);
-
-        // --- Collision Score (GAP 2: Formal Weighting) ---
-        double collisionWeight = 0;
-        double criticalCollisionWeight = 0;
-        for (int i = 0; i < scoringColors.size(); i++) {
-            double deltaE = deltaEs[i];
-            double collisionFactor;
-            if (deltaE < 5.0) {
-                collisionFactor = 1.0;
-                criticalCollisionWeight += normWeights[i];
-            } else if (deltaE < 12.0) {
-                collisionFactor = (12.0 - deltaE) / 7.0;
-            } else {
-                collisionFactor = 0.0;
-            }
-            collisionWeight += normWeights[i] * collisionFactor;
-        }
-        double collisionScore = clamp((1.0 - collisionWeight) * 100, 0, 100);
-
-        // --- Print Risk Score ---
-        double printRisk = 0;
-
-        // Risk 1: White-on-light
-        if (bgLab[0] > 80) {
-            printRisk += design.nearWhiteRatio() * 40;
-        }
-        // Risk 2: Black-on-dark
-        if (bgLab[0] < 25) {
-            printRisk += design.nearBlackRatio() * 40;
-        }
-        // Risk 3: High transparency + marginal contrast
-        if (design.transparencyRatio() > 0.7 && normalizedContrast < 60) {
-            printRisk += 15;
-        }
-        // Risk 4: Luminance collision
-        double lumDiff = Math.abs(design.meanLuminance() - bgLuminance);
-        if (lumDiff < 0.15) {
-            printRisk += 20 * (1.0 - lumDiff / 0.15);
-        }
-
-        double printRiskScore = clamp(100 - printRisk, 0, 100);
-
-        // --- 1. Compute Base Score ---
-        double baseScore =
-                contrastScore * CONTRAST_WEIGHT
-              + collisionScore * COLLISION_WEIGHT
-              + printRiskScore * PRINT_RISK_WEIGHT;
-
-        // --- 2. Compute Resistance ---
-        // Design Resistance Contract:
-        // - Purely design-dependent
-        // - Clamped 0-1
-        // - Monotonic
-        // Components: Darkness (55%), Structure (15%), Solidity (30%)
+        // 3. Fragility & Physics Weights (V3: Inverted Fragility)
+        // Design Resistance: Darkness (55%), Structure (15%), Solidity (30%)
         double rDarkness = 1.0 - design.nearWhiteRatio();
-        double rStructure = design.edgeDensity(); 
+        double rStructure = design.edgeDensity();
         double rSolidity = 1.0 - design.transparencyRatio();
-
         double designResistance = (0.55 * rDarkness) + (0.15 * rStructure) + (0.30 * rSolidity);
-        
-        // Explicitly clamp resistance to [0,1]
         designResistance = Math.max(0.0, Math.min(1.0, designResistance));
+        double fragility = Math.pow(1.0 - designResistance, 2.2);
 
-        // --- 3. Compute Fragility (New Model) ---
-        // fragility = pow(1.0 - resistance, 2.2)
-        // Robust designs -> fragility near 0
-        // Fragile designs -> fragility -> 1
-        double vulnerability = 1.0 - designResistance;
-        double fragility = Math.pow(vulnerability, 2.2);
+        // V3 Change: Fragile designs BOOST P10.
+        // Cap fragility boost at 1.6x
+        double fragilityBoost = 1.0 + (0.6 * fragility);
 
-        // --- 4. Compute Background Weakness ---
-        // backgroundWeakness = 1.0 - (baseScore / 100.0)
-        double backgroundWeakness = 1.0 - (baseScore / 100.0);
+        // V3 Weights: 0.45 Mean + 0.30 P10 + 0.20 Min
+        double termMean = 0.45 * weightedMeanDeltaE;
+        double termP10 = 0.30 * (p10DeltaE * fragilityBoost);
+        double termMin = 0.20 * minClusterDeltaE;
 
-        // --- 5. Apply Conditional Penalty ---
-        // penalty = baseScore * fragility * backgroundWeakness
-        double penalty = baseScore * fragility * backgroundWeakness;
-        // 'finalScore' in old logic is our 'technicalScore' or 'baseScore' for the new recommendation logic
-        double technicalScore = clamp(baseScore - penalty, 0.0, 100.0);
+        double rawContrast = termMean + termP10 + termMin;
 
-        // --- 6. Legibility Strength (Graded Penalty) ---
-        double legibilityPenaltyFactor = 1.0;
-        double legibilityContrast = 0.0;
+        // 4. Penalties (Tonal & Vibration)
+        double tonalPenalty = 0;
+        double vibrationPenalty = 0;
 
-        // Only apply if we detected significant High-Frequency content (0.5% area)
-        if (design.legibilityAreaRatio() >= 0.005 && design.legibilityLuminanceP50() >= 0) {
-            double p50 = design.legibilityLuminanceP50();
-            double L1 = Math.max(p50, bgLuminance);
-            double L2 = Math.min(p50, bgLuminance);
-            legibilityContrast = (L1 + 0.05) / (L2 + 0.05);
+        double bgHue = hueAngle(bgLabD[1], bgLabD[2]);
+        double minHueDist = 360.0;
+        for (DominantColor dc : colors) {
+             double dcHue = hueAngle(dc.labA(), dc.labB());
+             double dist = Math.abs(bgHue - dcHue);
+             if (dist > 180) dist = 360 - dist;
+             if (dist < minHueDist) minHueDist = dist;
+        }
 
-            System.out.printf("  Legibility: P50=%.2f (Contrast %.2f)\n", p50, legibilityContrast);
+        // Tonal Penalty
+        if (minHueDist < 15.0 
+                && minClusterDeltaE < 25.0 
+                && p10DeltaE < (thresholds.tailVetoFloor() * thresholds.tonalTriggerRatio())) {
+            tonalPenalty = -8.0;
+        }
 
-            if (legibilityContrast < 3.0) {
-                // lerp(0.55 -> 0.80)
-                double t = legibilityContrast / 3.0; // 0.0 to 1.0
-                legibilityPenaltyFactor = 0.55 + (0.25 * t);
-                System.out.printf("  Link: Penalty %.2fx (Contrast < 3.0)\n", legibilityPenaltyFactor);
-            } else if (legibilityContrast < 4.5) {
-                // lerp(0.80 -> 0.95)
-                double t = (legibilityContrast - 3.0) / 1.5; // 0.0 to 1.0
-                legibilityPenaltyFactor = 0.80 + (0.15 * t);
-                System.out.printf("  Link: Penalty %.2fx (Contrast < 4.5)\n", legibilityPenaltyFactor);
+        // Vibration Penalty (BgChroma > FgP75 * Ratio)
+        double bgChroma = Math.sqrt(bgLabD[1] * bgLabD[1] + bgLabD[2] * bgLabD[2]);
+        // Complementary Hue & Equiluminant
+        if (minHueDist >= 160.0 && minHueDist <= 200.0) {
+            double lumDiff = Math.abs(bgLabD[0] - design.foregroundMeanL());
+            if (lumDiff < 30.0) {
+                 if (bgChroma > (design.foregroundP75Chroma() * thresholds.vibrationChromaRatio())
+                     && design.foregroundP75Chroma() > 15.0) {
+                     vibrationPenalty = -5.0;
+                 }
             }
-        } else {
-             System.out.println("  Legibility: Skipped (Not enough HF content)");
+        }
+        
+        // Dominance Compression (Low coverage)
+        double coverage = (double) design.foregroundPixelCount() / design.totalPixelCount();
+        if (coverage < 0.15) {
+             rawContrast *= 0.85; 
         }
 
-        double scoreAfterLegibility = technicalScore * legibilityPenaltyFactor;
-
-        // --- 7. Visual Appeal Adjustment (Human Bias) ---
-        double appealFactor = calculateVisualAppeal(design, bgLab, bgRgb);
-        double scoreAfterAppeal = scoreAfterLegibility * (1.0 + appealFactor);
-
-        double finalScoreVal = clamp(scoreAfterAppeal, 0.0, 100.0);
-
-        // Determine Suitability (Legacy / Driver-dependent, but we set a default here)
-        Suitability suitability = Suitability.BAD;
-        if (finalScoreVal >= thresholds.goodFloor()) suitability = Suitability.GOOD;
-        else if (finalScoreVal >= thresholds.borderlineFloor()) suitability = Suitability.BORDERLINE;
-
-        // Override logic (just for reporting legibility fails in valid struct)
-        String overrideReason = null;
-        if (legibilityContrast > 0 && legibilityContrast < 3.0) {
-             overrideReason = String.format("Legibility %.1f < 3.0", legibilityContrast);
-        }
-
-        System.out.printf("SUMMARY: bg=%s | base=%.1f | pen=%.2f | appeal=%+.2f | final=%.1f | class=%s\n",
-                hexColor, technicalScore, legibilityPenaltyFactor, appealFactor, finalScoreVal, suitability);
-        System.out.println("--------------------------------------------------");
-
-        return new BackgroundEvaluationResult(
-                hexColor,
-                contrastScore,
-                collisionScore,
-                printRiskScore,
-                technicalScore,
-                legibilityContrast,
-                legibilityPenaltyFactor,
-                appealFactor,
-                finalScoreVal,
-                suitability,
-                overrideReason
+        return new RawScoringData(
+                rawContrast, 
+                p10DeltaE, 
+                minClusterDeltaE, 
+                weightedMeanDeltaE, 
+                fragility, 
+                tonalPenalty, 
+                vibrationPenalty,
+                bgLabD
         );
     }
 
-    private double calculateVisualAppeal(DesignAnalysisResult design, double[] bgLab, int bgRgb) {
-        double L = bgLab[0];
-        double a = bgLab[1];
-        double b = bgLab[2];
-        double C = Math.sqrt(a * a + b * b);
-        double hDegrees = Math.toDegrees(Math.atan2(b, a));
-        if (hDegrees < 0) hDegrees += 360.0;
+    // --- PHASE 2: FINAL EVALUATION (BUDGETED) ---
 
-        double appeal = 0.0;
-
-        // 1. Neutral Dark Bonus (+0.03)
-        // Black (L < 5)
-        boolean isBlack = L < 5.0;
-        // Charcoal/Pepper (L < 40, C < 10)
-        boolean isDarkNeutral = L < 40.0 && C < 10.0;
-        // Navy (H in [260, 280], L < 30)
-        boolean isNavy = (hDegrees >= 260 && hDegrees <= 280) && L < 30.0;
-
-        if (isBlack || isDarkNeutral || isNavy) {
-            appeal += 0.03;
+    public BackgroundEvaluationResult evaluateFinal(
+            RawScoringData raw, 
+            DesignAnalysisResult design, 
+            String hexColor, 
+            double rewardBudget, 
+            double aestheticScale
+    ) {
+        if (design.foregroundPixelCount() == 0) {
+             return new BackgroundEvaluationResult(hexColor, 0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, Suitability.BAD, "DEGENERATE");
         }
 
-        // 2. Near-White Aesthetic Risk (-0.03) (Constraint: Use Lab L* > 90 explicitly)
-        // If design.nearWhiteRatio() > 0.15 AND bgLab[0] > 90
-        if (design.nearWhiteRatio() > 0.15 && L > 90.0) {
-            appeal -= 0.03;
+        double[] bgLabD = raw.bgLab;
+        double rawScore = raw.netRawScore(); // Physics - Penalties
+
+        // --- AESTHETIC LAYER (Refinements) ---
+
+        // 1. Harmony Reward (Positive)
+        // Normalized by Contrast Confidence (Don't reward chaos)
+        // Tight Sigma = 25.0
+        double harmonyReward = 0.0;
+        double bgHue = hueAngle(bgLabD[1], bgLabD[2]);
+        double minHueDist = 360.0; 
+        for (DominantColor dc : design.dominantColors()) {
+             double dcHue = hueAngle(dc.labA(), dc.labB());
+             double dist = Math.abs(bgHue - dcHue);
+             if (dist > 180) dist = 360 - dist;
+             if (dist < minHueDist) minHueDist = dist;
         }
 
-        // 3. High Saturation Risk (-0.02)
-        // If Background Chroma C* > 50
-        if (C > 50.0) {
-            appeal -= 0.02;
+        if (raw.tonalPenalty == 0 && raw.vibrationPenalty == 0) {
+            double hueFactor = Math.exp(-Math.pow(minHueDist / thresholds.harmonySigma(), 2));
+            // Context Awareness: Scale by contrast confidence (Raw / 60)
+            double contrastConfidence = Math.min(1.0, raw.rawContrastScore / 60.0); 
+            harmonyReward = 4.0 * hueFactor * contrastConfidence;
         }
 
-        // 4. Harmony Bonus (+0.02)
-        // If Background Hue is within +/- 20 degrees of any DominantColor hue (weight > 0.10)
-        boolean hasHarmony = false;
-        if (C > 5.0) { // Only check hue if background has color
-            for (DominantColor dc : design.dominantColors()) {
-                if (dc.weight() > 0.10) {
-                    double dcC = Math.sqrt(dc.labA() * dc.labA() + dc.labB() * dc.labB());
-                    if (dcC > 5.0) {
-                        double dcH = Math.toDegrees(Math.atan2(dc.labB(), dc.labA()));
-                        if (dcH < 0) dcH += 360.0;
-                        
-                        double diff = Math.abs(hDegrees - dcH);
-                        if (diff > 180.0) diff = 360.0 - diff;
-                        
-                        if (diff <= 20.0) {
-                            hasHarmony = true;
-                            break;
-                        }
-                    }
-                }
+        // 2. Outline Boost (Directional Polarity)
+        // Uses Refactored DesignAnalyzer metric: whiteBlackEdgeRatio
+        double outlineBoost = 0.0;
+        if (isNearBlack(bgLabD)) {
+            // "Edge Polarity" = EdgeDensity * WhiteBlackAdjacencyRatio
+            // Boost = Scaled P10? No, boost is aesthetic reinforcement.
+            // Using logic: WhiteBlackEdgeRatio * 10, capped at 3.5.
+            outlineBoost = (design.whiteBlackEdgeRatio() * 10.0); 
+            outlineBoost = Math.min(3.5, outlineBoost);
+        }
+
+        // 3. Flatness Risk (Context-Aware Neutral Dampener)
+        // Target: Low Chroma AND Mid-High Luminance
+        // Context: Only if Design Contrast (P10) is weak relative to background (i.e. low P10)
+        double neutralDampener = 0.0;
+        double bgChroma = Math.sqrt(bgLabD[1]*bgLabD[1] + bgLabD[2]*bgLabD[2]);
+        double bgL = bgLabD[0];
+        
+        double chromaRisk = Math.exp(-Math.pow(bgChroma / 12.0, 2));
+        double lRisk = Math.exp(-Math.pow((bgL - 60.0) / 30.0, 2)); // Centered at 60
+        double flatnessRisk = chromaRisk * lRisk;
+        
+        // Protect High Contrast Designs: If P10 is high (>50), dampener is 0.
+        double normP10 = Math.min(1.0, raw.p10DeltaE / 50.0);
+        neutralDampener = -thresholds.flatnessPenaltyScale() * flatnessRisk * (1.0 - normP10);
+
+        // --- COMMERCIAL LAYER ---
+
+        // Market Weight (Scaled)
+        double marketBonus;
+        if (thresholds.marketWeights().containsKey(hexColor)) {
+            marketBonus = thresholds.marketWeights().get(hexColor);
+        } else {
+            marketBonus = computeDynamicMarketWeight(bgLabD) * 2.0; // V3: 2.0x Scaling
+        }
+
+        // Double Counting Guard: If Harmony > 2.0, reduce Market Bonus
+        if (harmonyReward > 2.0) {
+            marketBonus *= 0.5;
+        }
+
+        // --- BUDGET APPLICATION ---
+        
+        double positiveAdditions = harmonyReward + outlineBoost + Math.max(0, marketBonus);
+        
+        // Cap total positives by budget
+        if (positiveAdditions > rewardBudget) {
+            double scaling = rewardBudget / positiveAdditions;
+            harmonyReward *= scaling;
+            outlineBoost *= scaling;
+            if (marketBonus > 0) marketBonus *= scaling;
+        }
+
+        // Combine Final Score
+        double aestheticTotal = (harmonyReward + outlineBoost + neutralDampener) * aestheticScale;
+        
+        double finalScore = rawScore + aestheticTotal + marketBonus;
+        finalScore = clamp(finalScore, 0.0, 100.0);
+
+        // --- CLASSIFICATION ---
+        Suitability suitability;
+        boolean tailStrong = raw.p10DeltaE >= thresholds.tailVetoFloor();
+
+        if (finalScore >= thresholds.goodFloor()) {
+            if (tailStrong) suitability = Suitability.GOOD;
+            else suitability = Suitability.BORDERLINE;
+        } else if (finalScore >= thresholds.borderlineFloor()) {
+            if (tailStrong) suitability = Suitability.BORDERLINE;
+            else suitability = Suitability.BAD;
+        } else {
+            suitability = Suitability.BAD;
+        }
+
+        return new BackgroundEvaluationResult(
+                hexColor,
+                raw.p10DeltaE,
+                raw.minClusterDeltaE,
+                0.0,
+                rawScore, // 'Technical Score' maps to Raw Physics
+                0.0,
+                1.0,
+                aestheticTotal, // 'Appeal' maps to Aesthetics
+                neutralDampener, // 'Ink' maps to Dampener (Observable)
+                marketBonus,
+                finalScore,
+                suitability,
+                null
+        );
+    }
+    
+    // Legacy Adapter for Single-Pass usage (Default Budget)
+    public BackgroundEvaluationResult evaluate(DesignAnalysisResult design, String hexColor) {
+        RawScoringData raw = evaluateRaw(design, hexColor);
+        // Default Budget: 6.0
+        return evaluateFinal(raw, design, hexColor, 6.0, 1.0);
+    }
+
+    // --- UTILS ---
+
+    private double calculateP10DeltaE(DesignAnalysisResult design, float[] bgLab, double minClusterDeltaE) {
+        float[] pixels = design.foregroundPixelsLab();
+        if (pixels == null || pixels.length == 0) return minClusterDeltaE;
+
+        int count = pixels.length / 3;
+        double[] deltaEs = new double[count];
+        
+        for (int i = 0; i < count; i++) {
+            deltaEs[i] = ColorSpaceUtils.ciede2000Float(
+                    pixels[i * 3], pixels[i * 3 + 1], pixels[i * 3 + 2],
+                    bgLab[0], bgLab[1], bgLab[2]
+            );
+        }
+
+        int k = (int) (count * 0.10); 
+        if (k >= count) k = count - 1;
+        double rawP10 = quickSelect(deltaEs, 0, count - 1, k);
+
+        if (count < 200) {
+            double blend = count / 200.0;
+            return blend * rawP10 + (1.0 - blend) * minClusterDeltaE;
+        }
+        
+        return rawP10;
+    }
+
+    private double quickSelect(double[] arr, int left, int right, int k) {
+        if (left == right) return arr[left];
+        int pivotIndex = left + (right - left) / 2;
+        pivotIndex = partition(arr, left, right, pivotIndex);
+        if (k == pivotIndex) return arr[k];
+        else if (k < pivotIndex) return quickSelect(arr, left, pivotIndex - 1, k);
+        else return quickSelect(arr, pivotIndex + 1, right, k);
+    }
+    
+    private int partition(double[] arr, int left, int right, int pivotIndex) {
+        double pivotValue = arr[pivotIndex];
+        swap(arr, pivotIndex, right);
+        int storeIndex = left;
+        for (int i = left; i < right; i++) {
+            if (arr[i] < pivotValue) {
+                swap(arr, storeIndex, i);
+                storeIndex++;
             }
         }
-        if (hasHarmony) {
-            appeal += 0.02;
-        }
+        swap(arr, storeIndex, right);
+        return storeIndex;
+    }
+    
+    private void swap(double[] arr, int i, int j) {
+        double temp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = temp;
+    }
 
-        return clamp(appeal, -0.05, 0.05);
+    private double hueAngle(double a, double b) {
+        double h = Math.toDegrees(Math.atan2(b, a));
+        if (h < 0) h += 360.0;
+        return h;
     }
 
     private static double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
+    }
+    
+    private boolean isNearBlack(double[] lab) {
+        return lab[0] < 15.0; 
+    }
+
+    private double computeDynamicMarketWeight(double[] bgLab) {
+        double L = bgLab[0];
+        double a = bgLab[1];
+        double b = bgLab[2];
+        double chroma = Math.sqrt(a*a + b*b);
+        double hue = Math.toDegrees(Math.atan2(b, a));
+        if (hue < 0) hue += 360.0;
+
+        // V3 Market Weight
+        double neutralComponent = Math.exp(-Math.pow(chroma / 18.0, 2));
+        double midToneComponent = Math.exp(-Math.pow((L - 50.0) / 25.0, 2));
+        double vibrancyComponent = Math.pow(chroma / 100.0, 2);
+        
+        if (hue >= 340 || hue <= 30) {
+            vibrancyComponent *= 0.6; 
+        }
+
+        double hueComponent = 0.0;
+        if (hue >= 200 && hue <= 260) hueComponent = 0.3;
+        else if (hue >= 30 && hue <= 70) hueComponent = 0.2;
+        else if (hue >= 300 && hue < 340) hueComponent = -0.2;
+
+        double versatilityComponent = 1.0 - (chroma / 100.0);
+
+        double marketWeight =
+                0.7 * neutralComponent
+              + 0.2 * midToneComponent
+              - 1.4 * vibrancyComponent
+              + 0.4 * hueComponent
+              + 0.1 * versatilityComponent
+              - 0.35;
+
+        return Math.max(-2.0, Math.min(2.0, marketWeight));
     }
 }

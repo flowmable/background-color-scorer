@@ -59,93 +59,87 @@ public final class ColorSpaceUtils {
     }
 
     /**
-     * CIEDE2000 color difference.
-     * Full implementation per Sharma, Wu, Dalal (2005).
-     *
-     * @return ΔE₀₀ ≥ 0
+     * Calculates CIEDE2000 color difference between two Lab colors (float precision).
      */
-    public static double ciede2000(double L1, double a1, double b1,
-                                   double L2, double a2, double b2) {
-        double Lb = (L1 + L2) / 2.0;
-        double C1 = Math.sqrt(a1 * a1 + b1 * b1);
-        double C2 = Math.sqrt(a2 * a2 + b2 * b2);
-        double Cb = (C1 + C2) / 2.0;
-
-        double Cb7 = Math.pow(Cb, 7);
-        double G = 0.5 * (1.0 - Math.sqrt(Cb7 / (Cb7 + Math.pow(25.0, 7))));
-
-        double a1p = a1 * (1.0 + G);
-        double a2p = a2 * (1.0 + G);
-
-        double C1p = Math.sqrt(a1p * a1p + b1 * b1);
-        double C2p = Math.sqrt(a2p * a2p + b2 * b2);
-        double Cbp = (C1p + C2p) / 2.0;
-        double dCp = C2p - C1p;
-
-        double h1p = hueAngle(b1, a1p);
-        double h2p = hueAngle(b2, a2p);
-
-        double dhp;
-        if (C1p == 0 || C2p == 0) {
-            dhp = 0;
-        } else if (Math.abs(h2p - h1p) <= Math.PI) {
-            dhp = h2p - h1p;
-        } else if (h2p - h1p > Math.PI) {
-            dhp = h2p - h1p - 2.0 * Math.PI;
-        } else {
-            dhp = h2p - h1p + 2.0 * Math.PI;
-        }
-
-        double dHp = 2.0 * Math.sqrt(C1p * C2p) * Math.sin(dhp / 2.0);
-
-        double Hbp;
-        if (C1p == 0 || C2p == 0) {
-            Hbp = h1p + h2p;
-        } else if (Math.abs(h1p - h2p) <= Math.PI) {
-            Hbp = (h1p + h2p) / 2.0;
-        } else if (h1p + h2p < 2.0 * Math.PI) {
-            Hbp = (h1p + h2p + 2.0 * Math.PI) / 2.0;
-        } else {
-            Hbp = (h1p + h2p - 2.0 * Math.PI) / 2.0;
-        }
-
-        double T = 1.0
-                - 0.17 * Math.cos(Hbp - Math.toRadians(30))
-                + 0.24 * Math.cos(2.0 * Hbp)
-                + 0.32 * Math.cos(3.0 * Hbp + Math.toRadians(6))
-                - 0.20 * Math.cos(4.0 * Hbp - Math.toRadians(63));
-
-        double Lb50sq = (Lb - 50.0) * (Lb - 50.0);
-        double SL = 1.0 + 0.015 * Lb50sq / Math.sqrt(20.0 + Lb50sq);
-        double SC = 1.0 + 0.045 * Cbp;
-        double SH = 1.0 + 0.015 * Cbp * T;
-
-        double dTheta = Math.toRadians(30)
-                * Math.exp(-((Hbp - Math.toRadians(275)) / Math.toRadians(25))
-                * ((Hbp - Math.toRadians(275)) / Math.toRadians(25)));
-
-        double Cbp7 = Math.pow(Cbp, 7);
-        double RC = 2.0 * Math.sqrt(Cbp7 / (Cbp7 + Math.pow(25.0, 7)));
-        double RT = -Math.sin(2.0 * dTheta) * RC;
-
-        double dL = L2 - L1;
-        double kL = 1.0, kC = 1.0, kH = 1.0;
-
-        double lTerm = dL / (kL * SL);
-        double cTerm = dCp / (kC * SC);
-        double hTerm = dHp / (kH * SH);
-
-        return Math.sqrt(
-                lTerm * lTerm
-              + cTerm * cTerm
-              + hTerm * hTerm
-              + RT * cTerm * hTerm
-        );
+    public static float ciede2000Float(float L1, float a1, float b1, float L2, float a2, float b2) {
+        return (float) ciede2000(L1, a1, b1, L2, a2, b2);
     }
 
-    private static double hueAngle(double b, double ap) {
-        double h = Math.atan2(b, ap);
-        if (h < 0) h += 2.0 * Math.PI;
-        return h;
+    /**
+     * Calculates standard CIEDE2000 color difference.
+     * Reference implementation: http://www.ece.rochester.edu/~gsharma/ciede2000/
+     */
+    public static double ciede2000(double L1, double a1, double b1, double L2, double a2, double b2) {
+        double C1 = Math.sqrt(a1 * a1 + b1 * b1);
+        double C2 = Math.sqrt(a2 * a2 + b2 * b2);
+        double C_bar = (C1 + C2) / 2.0;
+
+        double G = 0.5 * (1.0 - Math.sqrt(Math.pow(C_bar, 7) / (Math.pow(C_bar, 7) + 6103515625.0))); // 25^7
+
+        double a1_prime = (1.0 + G) * a1;
+        double a2_prime = (1.0 + G) * a2;
+
+        double C1_prime = Math.sqrt(a1_prime * a1_prime + b1 * b1);
+        double C2_prime = Math.sqrt(a2_prime * a2_prime + b2 * b2);
+
+        double h1_prime = (b1 == 0 && a1_prime == 0) ? 0.0 : Math.toDegrees(Math.atan2(b1, a1_prime));
+        if (h1_prime < 0) h1_prime += 360.0;
+
+        double h2_prime = (b2 == 0 && a2_prime == 0) ? 0.0 : Math.toDegrees(Math.atan2(b2, a2_prime));
+        if (h2_prime < 0) h2_prime += 360.0;
+
+        double dL_prime = L2 - L1;
+        double dC_prime = C2_prime - C1_prime;
+        
+        double dh_prime = 0.0;
+        if (C1_prime * C2_prime != 0) {
+            double diff = h2_prime - h1_prime;
+            if (Math.abs(diff) <= 180) {
+                dh_prime = diff;
+            } else if (diff > 180) {
+                dh_prime = diff - 360;
+            } else {
+                dh_prime = diff + 360;
+            }
+        }
+        
+        double dH_prime = 2.0 * Math.sqrt(C1_prime * C2_prime) * Math.sin(Math.toRadians(dh_prime / 2.0));
+
+        double L_bar_prime = (L1 + L2) / 2.0; 
+        double C_bar_prime = (C1_prime + C2_prime) / 2.0;
+        
+        double h_bar_prime = h1_prime + h2_prime;
+        if (C1_prime * C2_prime != 0) {
+            double diff = Math.abs(h1_prime - h2_prime);
+            if (diff > 180) {
+                if ((h1_prime + h2_prime) < 360) h_bar_prime += 360;
+                else h_bar_prime -= 360;
+            }
+            h_bar_prime /= 2.0;
+        } else {
+            h_bar_prime = (h1_prime + h2_prime); 
+        }
+        
+        double T = 1.0 - 0.17 * Math.cos(Math.toRadians(h_bar_prime - 30))
+                       + 0.24 * Math.cos(Math.toRadians(2 * h_bar_prime))
+                       + 0.32 * Math.cos(Math.toRadians(3 * h_bar_prime + 6))
+                       - 0.20 * Math.cos(Math.toRadians(4 * h_bar_prime - 63));
+                       
+        double dTheta = 30 * Math.exp(-Math.pow((h_bar_prime - 275) / 25, 2));
+        double RC = 2.0 * Math.sqrt(Math.pow(C_bar_prime, 7) / (Math.pow(C_bar_prime, 7) + 6103515625.0));
+        double SL = 1.0 + (0.015 * Math.pow(L_bar_prime - 50, 2)) / Math.sqrt(20 + Math.pow(L_bar_prime - 50, 2));
+        double SC = 1.0 + 0.045 * C_bar_prime;
+        double SH = 1.0 + 0.015 * C_bar_prime * T;
+        double RT = -Math.sin(Math.toRadians(2 * dTheta)) * RC;
+        
+        double kL = 1.0;
+        double kC = 1.0;
+        double kH = 1.0;
+        
+        double term1 = dL_prime / (kL * SL);
+        double term2 = dC_prime / (kC * SC);
+        double term3 = dH_prime / (kH * SH);
+        
+        return Math.sqrt(term1*term1 + term2*term2 + term3*term3 + RT * term2 * term3);
     }
 }

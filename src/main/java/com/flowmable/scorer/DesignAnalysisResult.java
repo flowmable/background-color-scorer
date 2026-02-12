@@ -26,6 +26,9 @@ public record DesignAnalysisResult(
         double luminanceSpread,
         double edgeDensity,
         double transparencyRatio,
+    float[] foregroundPixelsLab, // Flattened [L, a, b, L, a, b...] (max 10k pixels)
+    double foregroundMeanL,
+    double foregroundP75Chroma,
         double nearWhiteRatio,
         double nearBlackRatio,
         int foregroundPixelCount,
@@ -33,5 +36,6 @@ public record DesignAnalysisResult(
         double legibilityLuminanceP25,
         double legibilityLuminanceP50,
         double legibilityLuminanceP75,
-        double legibilityAreaRatio
+        double legibilityAreaRatio,
+        double whiteBlackEdgeRatio
 ) {}

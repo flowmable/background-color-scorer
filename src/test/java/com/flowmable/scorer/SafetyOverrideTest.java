@@ -16,15 +16,13 @@ class SafetyOverrideTest {
 
     @Test
     void s1_collisionVeto_whiteOnWhite() {
-        // 100% white design on white bg → >60% critical collision → force BAD
+        // 100% white design on white bg -> P10=0 -> Score=0 -> BAD
         BufferedImage design = MandatoryTestCorpusTest.solidColor(255, 255, 255);
         DesignAnalysisResult analysis = analyzer.analyze(design);
         BackgroundEvaluationResult result = evaluator.evaluate(analysis, "#FFFFFF");
 
         assertEquals(Suitability.BAD, result.suitability());
-        assertNotNull(result.overrideReason());
-        assertTrue(result.overrideReason().contains("COLLISION_VETO"),
-                "Expected COLLISION_VETO override, got: " + result.overrideReason());
+        // V2 does not set explicit override string for contrast failure, just low score.
     }
 
     @Test
@@ -34,9 +32,8 @@ class SafetyOverrideTest {
         BackgroundEvaluationResult result = evaluator.evaluate(analysis, "#000000");
 
         assertEquals(Suitability.BAD, result.suitability());
-        assertNotNull(result.overrideReason());
-        assertTrue(result.overrideReason().contains("COLLISION_VETO"));
     }
+
 
     @Test
     void s3_degenerateVeto_fullyTransparent() {
